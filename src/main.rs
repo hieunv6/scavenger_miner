@@ -1,9 +1,15 @@
-use reqwest;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, ACCEPT};
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, Context};
 use std::time::Instant;
+use std::io::{self, Write};
 
-// ==================== API RESPONSE STRUCTURES ====================
+// Import AshMaize từ dependency
+use ashmaize::{hash, Rom, RomGenerationType};
+
+const BASE_URL: &str = "https://scavenger.prod.gd.midnighttge.io";
+
+// ==================== API STRUCTURES ====================
 
 #[derive(Debug, Deserialize)]
 struct TandCResponse {
@@ -15,7 +21,9 @@ struct TandCResponse {
 #[derive(Debug, Deserialize)]
 struct RegistrationResponse {
     #[serde(rename = "registrationReceipt")]
-    registration_receipt: RegistrationReceipt,
+    registration_receipt: Option<RegistrationReceipt>,
+    #[serde(flatten)]
+    extra: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,41 +68,47 @@ struct CryptoReceipt {
 
 // ==================== API CLIENT ====================
 
-const BASE_URL: &str = "https://scavenger.prod.gd.midnighttge.io";
-
 struct ScavengerAPI {
     client: reqwest::Client,
 }
 
 impl ScavengerAPI {
-    fn new() -> Self {
-        ScavengerAPI {
-            client: reqwest::Client::new(),
-        }
+    fn new() -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            ),
+        );
+        
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/plain, */*"),
+        );
+        
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client")?;
+        
+        Ok(ScavengerAPI { client })
     }
-
-    // 1. GET Terms & Conditions
+    
     async fn get_terms(&self) -> Result<TandCResponse> {
         let url = format!("{}/TandC", BASE_URL);
-        println!("📄 Fetching Terms & Conditions from: {}", url);
+        let response = self.client.get(&url).send().await?;
         
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch T&C")?;
+        if !response.status().is_success() {
+            let body = response.text().await?;
+            anyhow::bail!("Failed to fetch T&C: {}", body);
+        }
         
-        println!("   Status: {}", response.status());
-        
-        let tandc: TandCResponse = response
-            .json()
-            .await
-            .context("Failed to parse T&C response")?;
-        
-        Ok(tandc)
+        Ok(response.json().await?)
     }
 
-    // 2. POST Register Address
     async fn register(
         &self,
         address: &str,
@@ -106,51 +120,22 @@ impl ScavengerAPI {
             BASE_URL, address, signature, pubkey
         );
         
-        println!("📝 Registering address: {}", address);
-        println!("   URL length: {} chars", url.len());
-        
-        let response = self.client
-            .post(&url)
-            .send()
-            .await
-            .context("Failed to register")?;
-        
-        println!("   Status: {}", response.status());
+        let response = self.client.post(&url).send().await?;
         
         if !response.status().is_success() {
-            let error_text = response.text().await?;
-            println!("   Error body: {}", error_text);
-            anyhow::bail!("Registration failed: {}", error_text);
+            let body = response.text().await?;
+            anyhow::bail!("Registration failed: {}", body);
         }
         
-        let result: RegistrationResponse = response
-            .json()
-            .await
-            .context("Failed to parse registration response")?;
-        
-        Ok(result)
+        Ok(response.json().await?)
     }
 
-    // 3. GET Challenge
     async fn get_challenge(&self) -> Result<ChallengeResponse> {
         let url = format!("{}/challenge", BASE_URL);
-        println!("📡 Fetching challenge from: {}", url);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch challenge")?;
-        
-        let challenge: ChallengeResponse = response
-            .json()
-            .await
-            .context("Failed to parse challenge")?;
-        
-        Ok(challenge)
+        let response = self.client.get(&url).send().await?;
+        Ok(response.json().await?)
     }
 
-    // 4. POST Submit Solution
     async fn submit_solution(
         &self,
         address: &str,
@@ -162,46 +147,74 @@ impl ScavengerAPI {
             BASE_URL, address, challenge_id, nonce
         );
         
-        println!("📤 Submitting solution...");
-        println!("   Challenge: {}", challenge_id);
-        println!("   Nonce: {}", nonce);
-        
-        let response = self.client
-            .post(&url)
-            .send()
-            .await
-            .context("Failed to submit solution")?;
-        
-        println!("   Status: {}", response.status());
-        
-        let result: SolutionResponse = response
-            .json()
-            .await
-            .context("Failed to parse solution response")?;
-        
-        Ok(result)
+        let response = self.client.post(&url).send().await?;
+        Ok(response.json().await?)
     }
 
-    // 5. GET Work to Star Rate
     async fn get_star_rate(&self) -> Result<Vec<u64>> {
         let url = format!("{}/work_to_star_rate", BASE_URL);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch star rate")?;
-        
-        let rates: Vec<u64> = response
-            .json()
-            .await
-            .context("Failed to parse star rate")?;
-        
-        Ok(rates)
+        let response = self.client.get(&url).send().await?;
+        Ok(response.json().await?)
     }
 }
 
 // ==================== MINING LOGIC ====================
+
+struct MiningContext {
+    rom: Rom,
+    nb_loops: u32,
+    nb_instrs: u32,
+}
+
+impl MiningContext {
+    fn new(no_pre_mine: &str, nb_loops: u32, nb_instrs: u32) -> Self {
+        println!("🔧 Initializing AshMaize ROM...");
+        println!("   Seed: {}...", &no_pre_mine[..16.min(no_pre_mine.len())]);
+        println!("   Loops: {}", nb_loops);
+        println!("   Instructions: {}", nb_instrs);
+        
+        // ROM parameters
+        const PRE_SIZE: usize = 16 * 1024 * 1024;        // 16 KB
+        const ROM_SIZE: usize = 1024 * 1024 * 1024; // 10 MB
+        
+        let rom = Rom::new(
+            no_pre_mine.as_bytes(),
+            RomGenerationType::TwoStep {
+                pre_size: PRE_SIZE,
+                mixing_numbers: 4,
+            },
+            ROM_SIZE,
+        );
+        
+        println!("✅ ROM initialized ({} MB)", ROM_SIZE / 1_024 / 1_024);
+        
+        Self { rom, nb_loops, nb_instrs }
+    }
+    
+    fn hash(&self, preimage: &str) -> [u8; 64] {
+        hash(preimage.as_bytes(), &self.rom, self.nb_loops, self.nb_instrs)
+    }
+}
+
+fn meets_difficulty(hash: &[u8], difficulty: &str) -> bool {
+    let diff_bytes = match hex::decode(difficulty) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    
+    for i in 0..4.min(diff_bytes.len()) {
+        if i >= hash.len() {
+            return false;
+        }
+        if hash[i] < diff_bytes[i] {
+            return true;
+        }
+        if hash[i] > diff_bytes[i] {
+            return false;
+        }
+    }
+    true
+}
 
 fn build_preimage(
     nonce: &str,
@@ -220,218 +233,245 @@ fn build_preimage(
     )
 }
 
-// Placeholder mining function
 fn mine_challenge(
     address: &str,
     challenge: &Challenge,
     max_iterations: u64,
 ) -> Option<String> {
-    println!("\n🔨 Starting mining...");
+    println!("\n🔨 Mining started");
     println!("   Challenge ID: {}", challenge.challenge_id);
     println!("   Difficulty: {}", challenge.difficulty);
     println!("   Max iterations: {}", max_iterations);
     
+    // Initialize AshMaize
+    const NB_LOOPS: u32 = 8;
+    const NB_INSTRS: u32 = 256;
+    let ctx = MiningContext::new(&challenge.no_pre_mine, NB_LOOPS, NB_INSTRS);
+    
     let start = Instant::now();
     let mut last_report = Instant::now();
-    let mut nonce: u64 = 0;
     
-    while nonce < max_iterations {
+    // Start with random nonce to avoid collisions
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let random_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    println!("   Starting nonce: 0x{:016x}", random_start);
+    
+    for i in 0..max_iterations {
+        let nonce = random_start.wrapping_add(i);
         let nonce_hex = format!("{:016x}", nonce);
-        
+
         // Build preimage
         let preimage = build_preimage(&nonce_hex, address, challenge);
         
-        // TODO: Hash with AshMaize
-        // let hash = ashmaize_hash(&preimage);
+        // Hash with AshMaize
+        let hash = ctx.hash(&preimage);
         
-        // TODO: Check difficulty
-        // if meets_difficulty(&hash, &challenge.difficulty) {
-        //     println!("✅ Found valid nonce: {}", nonce_hex);
-        //     return Some(nonce_hex);
-        // }
-        
-        // Debug output every second
-        if last_report.elapsed().as_secs() >= 1 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = nonce as f64 / elapsed;
-            println!("   ⛏️  Nonce: {} | Rate: {:.0} H/s", nonce, rate);
-            last_report = Instant::now();
+        // Check difficulty
+        if meets_difficulty(&hash, &challenge.difficulty) {
+            let elapsed = start.elapsed();
+            println!("\n✅ FOUND VALID NONCE!");
+            println!("   Nonce: 0x{}", nonce_hex);
+            println!("   Nonce (dec): {}", nonce);
+            println!("   Hash: {}", hex::encode(&hash[..8]));
+            println!("   Time: {:.2}s", elapsed.as_secs_f64());
+            println!("   Rate: {:.0} H/s", i as f64 / elapsed.as_secs_f64());
+            return Some(nonce_hex);
         }
         
-        nonce += 1;
+        // Progress report every second
+        if last_report.elapsed().as_secs() >= 1 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = i as f64 / elapsed;
+            print!("\r   ⛏️  Iteration: {:>10} | Rate: {:>8.0} H/s | Time: {:>6.1}s", 
+                   i, rate, elapsed);
+            io::stdout().flush().unwrap();
+            last_report = Instant::now();
+        }
     }
     
-    println!("❌ No valid nonce found in {} iterations", max_iterations);
+    println!("\n❌ No valid nonce found in {} iterations", max_iterations);
     None
 }
 
-// ==================== WALLET FUNCTIONS ====================
+// ==================== REGISTRATION ====================
 
-// TODO: Implement proper Cardano wallet integration
-fn get_cardano_signature(message: &str) -> Result<(String, String)> {
-    println!("\n🔐 SIGNATURE REQUIRED");
+async fn interactive_register(
+    api: &ScavengerAPI,
+    address: &str,
+) -> Result<()> {
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                  📝 REGISTRATION PROCESS                    ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    
+    println!("\n📄 Fetching Terms & Conditions...");
+    let tandc = api.get_terms().await?;
+    println!("✅ Got T&C version: {}", tandc.version);
+    
+    println!("\n📋 Message to sign:");
+    println!("────────────────────────────────────────────────────────────────");
+    println!("{}", tandc.message);
+    println!("────────────────────────────────────────────────────────────────");
+    
+    println!("\n🔐 How to sign with Cardano wallet:");
     println!("════════════════════════════════════════════════════════════════");
-    println!("Message to sign:");
-    println!("{}", message);
-    println!("════════════════════════════════════════════════════════════════");
-    println!("\nPlease sign this message with your Cardano wallet.");
-    println!("Instructions:");
-    println!("1. Open your Cardano wallet (Nami, Eternl, etc.)");
-    println!("2. Go to Developer Tools (F12 in browser)");
-    println!("3. Run the following in Console:");
-    println!("\n--- JavaScript Code ---");
+    println!("1. Open your Cardano wallet in browser (Nami/Eternl/Yoroi)");
+    println!("2. Open Developer Tools (Press F12)");
+    println!("3. Go to Console tab");
+    println!("4. Copy and paste this code:\n");
+    
     println!("const api = await cardano.nami.enable();");
-    println!("const addresses = await api.getUsedAddresses();");
-    println!("const message = `{}`;", message);
-    println!("const signed = await api.signData(addresses[0], Buffer.from(message).toString('hex'));");
+    println!("const addrs = await api.getUsedAddresses();");
+    println!("const msg = \"{}\";", tandc.message.replace("\"", "\\\""));
+    println!("const signed = await api.signData(addrs[0], Buffer.from(msg).toString('hex'));");
     println!("console.log('Signature:', signed.signature);");
     println!("console.log('Pubkey:', signed.key);");
-    println!("--- End Code ---\n");
     
-    println!("Enter signature (CIP-30 format):");
+    println!("\n════════════════════════════════════════════════════════════════");
+    println!("5. Copy the outputs and paste below\n");
+    
+    println!("Enter signature:");
     let mut signature = String::new();
-    std::io::stdin().read_line(&mut signature)?;
+    io::stdin().read_line(&mut signature)?;
     let signature = signature.trim().to_string();
     
-    println!("Enter public key (64 hex chars):");
+    println!("Enter public key:");
     let mut pubkey = String::new();
-    std::io::stdin().read_line(&mut pubkey)?;
+    io::stdin().read_line(&mut pubkey)?;
     let pubkey = pubkey.trim().to_string();
     
     if pubkey.len() != 64 {
         anyhow::bail!("Invalid pubkey length: {} (expected 64)", pubkey.len());
     }
     
-    Ok((signature, pubkey))
+    println!("\n📤 Registering...");
+    let result = api.register(address, &signature, &pubkey).await?;
+    
+    if let Some(receipt) = result.registration_receipt {
+        println!("✅ Registration successful!");
+        println!("   Timestamp: {}", receipt.timestamp);
+    } else {
+        println!("✅ Registration completed");
+    }
+    
+    Ok(())
 }
 
-// ==================== MAIN FUNCTION ====================
+// ==================== MAIN ====================
+fn wait_for_enter() {
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║            Press ENTER to exit...                            ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║           🌙 SCAVENGER MINER v0.1.0                        ║");
+    println!("║              🌙 SCAVENGER MINER v0.2.0                      ║");
+    println!("║           Powered by AshMaize Algorithm                     ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
     
-    // Initialize API client
-    let api = ScavengerAPI::new();
+    let api = ScavengerAPI::new()?;
     
     // TODO: Replace with your Cardano address
-    let my_address = "addr1qqwzupt3gvehw9s92w2qwsjkk7wl0lpkq5vq9n80cxed80e2wumjk88lz63vlc0f5c6tl2hrca8geqvguczr74ezjhcq2x66y3";
+    println!("Enter your Cardano address:");
+    let mut my_address = String::new();
+    io::stdin().read_line(&mut my_address)?;
+    let my_address = my_address.trim();
     
-    println!("📍 Your address: {}\n", my_address);
+    println!("\n📍 Address: {}", my_address);
     
-    // ========== STEP 1: Get Terms & Conditions ==========
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("STEP 1: Fetching Terms & Conditions");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    
-    let tandc = api.get_terms().await?;
-    println!("✅ Got T&C version: {}", tandc.version);
-    println!("   Content length: {} chars", tandc.content.len());
-    println!("   Message to sign: {}", tandc.message);
-    
-    // ========== STEP 2: Register Address ==========
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("STEP 2: Register Address");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    
-    println!("\nDo you want to register this address? (y/n)");
+    // Registration (optional)
+    println!("\nDo you want to register? (y/n)");
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    io::stdin().read_line(&mut input)?;
     
     if input.trim().to_lowercase() == "y" {
-        // Get signature from user
-        let (signature, pubkey) = get_cardano_signature(&tandc.message)?;
-        
-        println!("\n📝 Attempting registration...");
-        match api.register(my_address, &signature, &pubkey).await {
-            Ok(reg_response) => {
-                println!("✅ Registration successful!");
-                println!("   Timestamp: {}", reg_response.registration_receipt.timestamp);
-                println!("   Signature: {}...", &reg_response.registration_receipt.signature[..16]);
-            }
+        match interactive_register(&api, my_address).await {
+            Ok(_) => println!("\n✅ Registration successful!"),
             Err(e) => {
-                println!("⚠️  Registration failed: {}", e);
-                println!("   This might be OK if you're already registered.");
+                println!("\n⚠️  Registration failed: {}", e);
                 println!("   Continuing to mining...");
             }
         }
     } else {
-        println!("⏭️  Skipping registration (assuming already registered)");
+        println!("⏭️  Skipping registration");
     }
     
-    // ========== STEP 3: Get Challenge ==========
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("STEP 3: Fetching Current Challenge");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    // Get challenge
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                  📡 FETCHING CHALLENGE                       ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
     
     let challenge_response = api.get_challenge().await?;
-    println!("✅ Got challenge!");
-    println!("   Status: {}", challenge_response.code);
-    println!("   Challenge ID: {}", challenge_response.challenge.challenge_id);
+    println!("\n✅ Challenge received:");
+    println!("   ID: {}", challenge_response.challenge.challenge_id);
     println!("   Day: {}", challenge_response.challenge.day);
     println!("   Challenge #: {}", challenge_response.challenge.challenge_number);
     println!("   Difficulty: {}", challenge_response.challenge.difficulty);
     println!("   Deadline: {}", challenge_response.mining_period_ends);
     
-    // ========== STEP 4: Mine ==========
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("STEP 4: Mining");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    // Mining
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                      ⛏️  MINING                              ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
     
-    let max_iterations = 100_000; // Limit for testing
+    println!("\nHow many hashes to try?");
+    println!("  100000     = Quick test (~few minutes)");
+    println!("  1000000    = Medium test");
+    println!("  100000000  = Serious mining (hours)");
+    println!("\nEnter number:");
+    
+    let mut iterations_input = String::new();
+    io::stdin().read_line(&mut iterations_input)?;
+    let max_iterations: u64 = iterations_input
+        .trim()
+        .parse()
+        .unwrap_or(100_000);
     
     if let Some(nonce) = mine_challenge(
         my_address,
         &challenge_response.challenge,
         max_iterations,
     ) {
-        // ========== STEP 5: Submit Solution ==========
-        println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("STEP 5: Submitting Solution");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        // Submit solution
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║                  📤 SUBMITTING SOLUTION                      ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
         
-        let solution_result = api.submit_solution(
+        let result = api.submit_solution(
             my_address,
             &challenge_response.challenge.challenge_id,
             &nonce,
         ).await?;
         
-        if let Some(receipt) = solution_result.crypto_receipt {
-            println!("✅ Solution accepted!");
+        if let Some(receipt) = result.crypto_receipt {
+            println!("\n🎉🎉🎉 SOLUTION ACCEPTED! 🎉🎉🎉");
             println!("   Timestamp: {}", receipt.timestamp);
-            println!("   Signature: {}...", &receipt.signature[..16]);
-        } else {
-            println!("⚠️  Solution submitted but no receipt returned");
-            println!("   Response: {:?}", solution_result.extra);
-        }
-    } else {
-        println!("\n⚠️  Mining stopped. No valid nonce found.");
-        println!("   Note: AshMaize algorithm not implemented yet.");
-        println!("   This is expected with the placeholder code.");
-    }
-    
-    // ========== BONUS: Get Star Rate ==========
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("BONUS: Checking Reward Rates");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    
-    match api.get_star_rate().await {
-        Ok(rates) => {
-            println!("✅ Star rates (STAR per solution):");
-            for (day, rate) in rates.iter().enumerate() {
-                println!("   Day {:2}: {:>10} STAR", day + 1, rate);
+            
+            // Check reward
+            if let Ok(rates) = api.get_star_rate().await {
+                let day = challenge_response.challenge.day as usize;
+                if day > 0 && day <= rates.len() {
+                    println!("\n⭐ REWARD: {} STAR tokens!", rates[day - 1]);
+                }
             }
-        }
-        Err(e) => {
-            println!("⚠️  Failed to fetch star rates: {}", e);
+        } else {
+            println!("\n📋 Solution submitted");
+            println!("   Response: {:?}", result.extra);
         }
     }
     
     println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║                    🎉 PROGRAM COMPLETE                       ║");
+    println!("║                    ✅ PROGRAM COMPLETE                       ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    
+    wait_for_enter();
     Ok(())
 }
