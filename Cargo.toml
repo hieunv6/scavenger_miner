@@ -19,6 +19,7 @@ chrono = "0.4"
 
 # AshMaize - Direct from GitHub
 ashmaize = { git = "https://github.com/input-output-hk/ce-ashmaize", branch = "master" }
+num_cpus = "1.17.0"
 
 # Optimization for release builds
 [profile.release]

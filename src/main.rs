@@ -174,8 +174,8 @@ impl MiningContext {
         println!("   Instructions: {}", nb_instrs);
         
         // ROM parameters
-        const PRE_SIZE: usize = 16 * 1024 * 1024;        // 16 KB
-        const ROM_SIZE: usize = 1024 * 1024 * 1024; // 10 MB
+        const PRE_SIZE: usize = 16 * 1024 * 1024;        // 16 MB
+        const ROM_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
         
         let rom = Rom::new(
             no_pre_mine.as_bytes(),
@@ -287,7 +287,7 @@ fn mine_challenge(
             let elapsed = start.elapsed().as_secs_f64();
             let rate = i as f64 / elapsed;
             print!("\r   ⛏️  Iteration: {:>10} | Rate: {:>8.0} H/s | Time: {:>6.1}s", 
-                   i, rate, elapsed);
+                i, rate, elapsed);
             io::stdout().flush().unwrap();
             last_report = Instant::now();
         }
